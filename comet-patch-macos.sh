@@ -1,259 +1,154 @@
 #!/usr/bin/env bash
 # -----------------------------------------------------------------------------
-# Comet – CPLX Installer
+# Comet Extension Unblocker for macOS (v2 – policy method)
 # -----------------------------------------------------------------------------
-# By default, Comet does not allow extensions to tweak its "perplexity.ai"
-# new tab page (likely to prevent ad blockers etc.; it also prevents the
-# "Complexity" extension from working!).
+# Comet (Perplexity's Chromium-based browser) ships a built-in ExtensionSettings
+# policy that blocks every extension from running on *.perplexity.ai. That is
+# why Complexity, ad blockers, userscript managers etc. do nothing on the
+# Perplexity site or the Comet new-tab page.
 #
-# We've found a simple, safe workaround:
-# This installer creates a wrapper shortcut app named:
-#   ~/Applications/Comet - CPLX.app
+# v1 of this script flipped "Allow-external-extensions-scripting-on-NTP" in
+# Local State right before launch. Current Comet builds no longer honour (or
+# even write) that key, so the wrapper-app approach is dead.
 #
-# When you launch *that* shortcut app, it:
-#   1) offers to quit Comet if it's already running,
-#   2) flips "Allow-external-extensions-scripting-on-NTP" to true in:
-#        ~/Library/Application Support/Comet/Local State
-#   3) launches the real Comet.
+# v2 uses the method found by the Complexity developer (pnd280): install a
+# *managed* Chromium policy for Comet's bundle id that explicitly re-allows
+# *://*.perplexity.ai for all extensions. Managed policies win over the
+# browser's built-in defaults, survive updates, and need no wrapper app.
 #
-# Result: Complexity will work! (as extensions can modify the new tab page)
+#   File written:  /Library/Managed Preferences/ai.perplexity.comet.plist
+#   Policy:        ExtensionSettings -> "*" -> runtime_allowed_hosts
 #
-# Notes:
-# - No admin required. Built-in libraries only (bash, sed, awk, osascript).
-# - A per-launch log is written to: ~/Library/Logs/Comet-CPLX.log
-# - This does NOT modify Comet.app itself; it just creates a wrapper app.
+# Needs sudo ONCE (that directory is root-owned). Nothing inside Comet.app is
+# touched. Verify afterwards at  comet://policy  (ExtensionSettings is listed).
+#
+# Usage:
+#   bash comet-patch-macos.sh              # install (or report already enabled)
+#   bash comet-patch-macos.sh --status     # check only
+#   bash comet-patch-macos.sh --uninstall  # remove the policy + old v1 wrapper
 # -----------------------------------------------------------------------------
 
 set -euo pipefail
 
-# ----------------------------- Config & Paths --------------------------------
-APP_NAME="Comet - CPLX"
-BUNDLE_ID="app.cplx.cometpatched"
+BUNDLE_ID="ai.perplexity.comet"
+PREFS_DIR="/Library/Managed Preferences"
+PLIST_PATH="${PREFS_DIR}/${BUNDLE_ID}.plist"
+HOST_PATTERN="*://*.perplexity.ai"
 
-TARGET_DIR="${HOME}/Applications"                   # Wrapper app location
-APP_DIR="${TARGET_DIR}/${APP_NAME}.app"
-CONTENTS_DIR="${APP_DIR}/Contents"
-MACOS_DIR="${CONTENTS_DIR}/MacOS"
-RES_DIR="${CONTENTS_DIR}/Resources"
+# Leftovers from v1 (wrapper-app method) – cleaned up on install/uninstall.
+OLD_APP="${HOME}/Applications/Comet - CPLX.app"
+OLD_LOG="${HOME}/Library/Logs/Comet-CPLX.log"
+OLD_BACKUP="${HOME}/Library/Application Support/Comet/Local State.cplx.bak"
 
-ICON_NAME="app.icns"
-INSTALL_LOG_PREFIX="[Installer]"
-
-# ----------------------------- Pretty Printers --------------------------------
-# important: send installer logs to STDERR so command substitutions don't capture them
-msg()  { printf "%s %s\n" "$INSTALL_LOG_PREFIX" "$*" >&2; }
+msg()  { printf "%s\n" "$*" >&2; }
 ok()   { printf "✔ %s\n" "$*" >&2; }
 warn() { printf "⚠ %s\n" "$*" >&2; }
 err()  { printf "✖ %s\n" "$*" >&2; }
 
-# ------------------------------ Intro Banner ----------------------------------
-print_intro() {
-  printf "\n" >&2
-  printf "============================================================\n" >&2
-  printf "   Comet Complexity Fixer for macOS (by github.com/theJayTea)\n" >&2
-  printf "============================================================\n\n" >&2
-  printf "Comet blocks extensions on the perplexity.ai pages, so Complexity can't work by default (maybe they do this to prevent ad-blockers stopping Perplexity tracking/ads?).\n" >&2
-  printf "\n" >&2
-  printf "This script creates a new shortcut/wrapper app called 'Comet - CPLX.app'. Simply launch Comet by opening *this* new shortcut!\n"
-  printf "\n" >&2
-  printf "This shortcut app flips an internal Comet setting right before it launches Comet for you, to fix the issue :)\n" >&2
-  printf "\n" >&2
-  printf "============================================================\n\n" >&2
-  printf "⚙️  Script Log:" >&2
-  printf "\n\n" >&2
+[[ "$(uname)" == "Darwin" ]] || { err "This script only works on macOS."; exit 1; }
+
+is_enabled() {
+  # `defaults read` on the managed-prefs domain shows what Comet will see.
+  defaults read "${PREFS_DIR}/${BUNDLE_ID}" ExtensionSettings 2>/dev/null \
+    | grep -Fq "$HOST_PATTERN"
 }
 
-# -------------------------- Find Comet.app (friendly) -------------------------
-find_comet_app() {
-  msg "Looking for Comet.app in the usual places…"
-  for candidate in "/Applications/Comet.app" "${HOME}/Applications/Comet.app"; do
-    if [[ -d "$candidate" ]]; then
-      ok "Found Comet installed at: $candidate"
-      # Only the path goes to STDOUT:
-      echo "$candidate"
-      return 0
-    fi
-  done
-  warn "Comet.app wasn’t found in /Applications or ~/Applications."
-  msg  "Please pick it in the dialog… (Select the real Comet.app)"
+comet_running() { pgrep -xq "Comet" 2>/dev/null; }
 
-  # Let the user choose interactively (logs go to STDERR via msg/ok/warn)
-  local chosen
-  set +e
-  chosen="$(osascript <<'AS'
-    try
-      set theApp to choose application with prompt "Select Comet.app"
-      POSIX path of (theApp as alias)
-    on error
-      return ""
-    end try
-AS
-)"
-  local rc=$?
-  set -e
-  if [[ $rc -ne 0 || -z "$chosen" || ! -d "${chosen%/}" ]]; then
-    err "No valid app selected. Exiting."
-    exit 1
+restart_hint() {
+  if comet_running; then
+    warn "Comet is running. Quit it fully (Cmd+Q) and reopen for the policy to apply."
+  else
+    msg "Open Comet normally (the regular Dock icon is fine now)."
   fi
-  ok "Using Comet at: ${chosen%/}"
-  # Only the path to STDOUT:
-  echo "${chosen%/}"
+  msg "Check:  comet://policy  should list ExtensionSettings with ${HOST_PATTERN}."
 }
 
-# --------------------------------- Run! ---------------------------------------
-print_intro
+remove_v1_leftovers() {
+  local removed=0
+  if [[ -d "$OLD_APP" ]]; then rm -rf "$OLD_APP"; removed=1; fi
+  if [[ -f "$OLD_LOG" ]]; then rm -f "$OLD_LOG"; removed=1; fi
+  if [[ -f "$OLD_BACKUP" ]]; then rm -f "$OLD_BACKUP"; removed=1; fi
+  [[ $removed -eq 1 ]] && ok "Removed the old v1 'Comet - CPLX' wrapper app / log / backup."
+  return 0
+}
 
-# Capture only the path (no log noise now)
-COMET_APP_PATH="$(find_comet_app)"
-# Safety: strip trailing slash if any
-COMET_APP_PATH="${COMET_APP_PATH%/}"
-ICON_SRC="${COMET_APP_PATH}/Contents/Resources/app.icns"
+install_policy() {
+  if is_enabled; then
+    ok "Policy already installed – extensions are allowed on ${HOST_PATTERN}."
+    remove_v1_leftovers
+    restart_hint
+    return 0
+  fi
 
-# --------------------------- Build .app bundle --------------------------------
-msg "Creating wrapper shortcut app at: ${APP_DIR}"
-mkdir -p "${MACOS_DIR}" "${RES_DIR}"
+  msg "Installing managed policy for ${BUNDLE_ID} (sudo password needed once)…"
+  sudo mkdir -p "$PREFS_DIR"
 
-# Minimal Info.plist for a runnable Application bundle
-cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
+  # Write the whole plist atomically instead of several PlistBuddy edits.
+  # "*" applies to every extension; runtime_allowed_hosts overrides Comet's
+  # built-in runtime_blocked_hosts for perplexity.ai.
+  sudo tee "$PLIST_PATH" >/dev/null <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>CFBundleName</key><string>${APP_NAME}</string>
-  <key>CFBundleDisplayName</key><string>${APP_NAME}</string>
-  <key>CFBundleIdentifier</key><string>${BUNDLE_ID}</string>
-  <key>CFBundleVersion</key><string>1.2.2</string>
-  <key>CFBundleShortVersionString</key><string>1.2.2</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleExecutable</key><string>${APP_NAME}</string>
-  <key>CFBundleIconFile</key><string>${ICON_NAME%.*}</string>
-</dict></plist>
+<plist version="1.0">
+<dict>
+  <key>ExtensionSettings</key>
+  <dict>
+    <key>*</key>
+    <dict>
+      <key>runtime_allowed_hosts</key>
+      <array>
+        <string>${HOST_PATTERN}</string>
+      </array>
+      <key>runtime_blocked_hosts</key>
+      <array/>
+    </dict>
+  </dict>
+</dict>
+</plist>
 PLIST
+  sudo chown root:wheel "$PLIST_PATH"
+  sudo chmod 644 "$PLIST_PATH"
+  # Make cfprefsd pick up the new managed domain right away.
+  sudo killall cfprefsd 2>/dev/null || true
 
-# "Borrow" Comet's icon if present so our CPLX shortcut app looks nice :p
-if [[ -f "${ICON_SRC}" ]]; then
-  cp -f "${ICON_SRC}" "${RES_DIR}/${ICON_NAME}" || true
-  ok "'Borrowed' Comet’s icon so the shortcut looks nice heh"
-else
-  warn "Tried to borrow Comet’s icon, but couldn’t find it at: ${ICON_SRC}"
-  warn "Proceeding without a custom icon."
-fi
-
-# ----------------------- Launcher script inside the app -----------------------
-# This is what runs when you double-click "Comet - CPLX".
-cat > "${MACOS_DIR}/${APP_NAME}" <<'LAUNCHER'
-#!/usr/bin/env bash
-set -euo pipefail
-
-# (Installer will substitute this path)
-COMET_APP_PATH="@@COMET_APP_PATH@@"
-
-USER_DATA_DIR="${HOME}/Library/Application Support/Comet"
-LOCAL_STATE="${USER_DATA_DIR}/Local State"
-BACKUP="${LOCAL_STATE}.cplx.bak"
-LOG="${HOME}/Library/Logs/Comet-CPLX.log"
-
-# ----------------------------- Helpers ---------------------------------------
-log()  { printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG"; }
-is_running() { osascript -e 'application "Comet" is running' 2>/dev/null | grep -qi true; }
-
-ensure_dirs() {
-  mkdir -p "${USER_DATA_DIR}"
-  mkdir -p "$(dirname "$LOG")"
-  : > "$LOG" || true
-}
-
-backup_local_state() {
-  if [[ -f "$LOCAL_STATE" ]]; then
-    cp -f "$LOCAL_STATE" "$BACKUP" || true
+  if is_enabled; then
+    ok "Policy installed at: ${PLIST_PATH}"
   else
-    # Create a minimal JSON file so sed/grep have something sane.
-    printf '{}' > "$LOCAL_STATE"
-  fi
-}
-
-verify_true() {
-  grep -Eq '"Allow-external-extensions-scripting-on-NTP"[[:space:]]*:[[:space:]]*true' "$LOCAL_STATE"
-}
-
-sed_patch() {
-  # Flip ANY occurrences of false -> true for that key (global replace).
-  local before after
-  before="$(grep -Eo '"Allow-external-extensions-scripting-on-NTP"[[:space:]]*:[[:space:]]*(true|false)' "$LOCAL_STATE" || true)"
-  /usr/bin/sed -E -i '' \
-    's/"Allow-external-extensions-scripting-on-NTP"[[:space:]]*:[[:space:]]*false/"Allow-external-extensions-scripting-on-NTP": true/g' \
-    "$LOCAL_STATE"
-  after="$(grep -Eo '"Allow-external-extensions-scripting-on-NTP"[[:space:]]*:[[:space:]]*(true|false)' "$LOCAL_STATE" || true)"
-  log "Before: ${before:-<none>}  ->  After: ${after:-<none>}"
-}
-
-ask_quit_if_running() {
-  if is_running; then
-    osascript <<'AS' || true
-      try
-        display dialog "Comet is currently running.
-
-Quit and relaunch with the patch applied?" buttons {"Cancel", "Quit & Relaunch"} default button "Quit & Relaunch" with icon caution
-        tell application "Comet" to quit
-      on error
-      end try
-AS
-    # Wait up to ~10s for Comet to quit
-    i=0
-    while is_running && [ $i -lt 100 ]; do
-      sleep 0.1
-      i=$((i+1))
-    done
-  fi
-}
-
-launch_comet() {
-  if [[ -d "$COMET_APP_PATH" ]]; then
-    log "Launching Comet via path."
-    open "$COMET_APP_PATH"
-  else
-    log "Launching Comet via app name."
-    open -a "Comet"
-  fi
-}
-
-main() {
-  log "=== Comet - CPLX launch begin ==="
-  ensure_dirs
-  ask_quit_if_running
-  backup_local_state
-  sed_patch
-
-  if verify_true; then
-    log "Verification: key is TRUE before launch."
-    launch_comet
-  else
-    log "Verification failed; not launching Comet to avoid confusion."
-    log "Check your Local State file and try again."
+    err "Wrote the file but could not read the policy back. Check ${PLIST_PATH}."
     exit 1
   fi
-  log "=== Comet - CPLX launch end ==="
+
+  remove_v1_leftovers
+  restart_hint
 }
-main "$@"
-LAUNCHER
 
-# ---------------------- Substitute the Comet path safely ----------------------
-# Escape slashes and ampersands for sed; COMET_APP_PATH has no newlines now.
-escaped_path="$(printf '%s' "${COMET_APP_PATH}" | sed -e 's/[\/&]/\\&/g')"
-# macOS sed inline edit syntax: -i '' (no backup)
-sed -E -i '' "s/@@COMET_APP_PATH@@/${escaped_path}/g" "${MACOS_DIR}/${APP_NAME}"
-chmod +x "${MACOS_DIR}/${APP_NAME}"
+uninstall_policy() {
+  if [[ -f "$PLIST_PATH" ]]; then
+    msg "Removing ${PLIST_PATH} (sudo password needed once)…"
+    sudo rm -f "$PLIST_PATH"
+    sudo killall cfprefsd 2>/dev/null || true
+    ok "Policy removed. Comet will block extensions on perplexity.ai again after a restart."
+  else
+    msg "No policy file found at ${PLIST_PATH}; nothing to remove."
+  fi
+  remove_v1_leftovers
+}
 
-# ----------------------------- Friendly outro --------------------------------
-printf "\n" >&2
-  printf "============================================================\n\n" >&2
-ok "✅ Done! Created: ${APP_NAME}.app :3"
-printf "\n" >&2
-printf "✅ What’s next:\n" >&2
-printf "  • Open Spotlight and launch Comet through this patched shortcut: %s\n" "${APP_NAME}" >&2
-printf "  • The patched shortcut is saved at: %s\n" "${TARGET_DIR}" >&2
-printf "  • You can replace your original Comet dock icon with this!\n" >&2
-printf "\n" >&2
-printf "If you're curious, each launch through the patched shortcut will:\n" >&2
-printf "  1) Ensure Comet isn’t running (offers to quit),\n" >&2
-printf "  2) Re-flip Local State's "Allow-external-extensions-scripting-on-NTP" key to TRUE (the harmless patch),\n" >&2
-printf "  3) Then launch Comet!\n" >&2
+status() {
+  if is_enabled; then
+    ok "ENABLED – ${PLIST_PATH} allows extensions on ${HOST_PATTERN}."
+  else
+    msg "DISABLED – no managed policy for ${BUNDLE_ID}."
+  fi
+  [[ -d "$OLD_APP" ]] && warn "Old v1 wrapper app still present: ${OLD_APP} (run install or --uninstall to clean it up)."
+  return 0
+}
+
+case "${1:-}" in
+  --status|-s)      status ;;
+  --uninstall|-u)   uninstall_policy ;;
+  --help|-h)        sed -n '2,30p' "$0" ;;
+  "")               install_policy ;;
+  *)                err "Unknown option: $1 (use --status, --uninstall, or no option to install)"; exit 2 ;;
+esac
